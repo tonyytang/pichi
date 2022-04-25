@@ -12,12 +12,102 @@
 #include <sstream>
 
 using namespace std;
+using boost::beast::http;
 namespace asio = boost::asio;
 namespace http = boost::beast::http;
 namespace json = rapidjson;
 namespace sys = boost::system;
 
 namespace pichi::api {
+
+template <class TBody>
+response<TBody>*
+DelegateHandler<TBody>::handleRequest(request<TBody> const * request)
+{
+    if (inner) {
+        return inner->handleRequest(request);
+    }
+
+    return NULL;
+}
+
+template <class TBody>
+response<TBody>*
+CorsDelegateHandler<TBody>::handleRequest(request<TBody> const * request)
+{
+    if (request->method() == verb::options) {
+        auto response = new ::response<TBody>{status::no_content};
+        response.set("Access-Control-Allow-Methods", "*");
+        response.set("Access-Control-Allow-Headers", "*");
+        
+        return response;
+    }
+
+    return DelegateHandler<TBody>::handlerRequest(request);
+}
+
+template <class TBody>
+response<TBody>*
+Route<TBody>::handleRequestIfMatches(request<TBody> const * request)
+{
+  auto m = cmatch{};
+  auto target = request->target();
+  if (request->method() == get<0>(this) &&
+    regex_match(target.data(), target.data() + target.size(), m, get<1>(this))) {
+    return invoke(get<2>(*this), request, m);
+  }
+  
+  return NULL;
+}
+
+template <class TBody>
+Config<TBody>::Config()
+  : _handler(new Config<TBody>::RouteRequestHandler(_routes))
+{
+}
+
+template <class TBody>
+Config<TBody>::~Config()
+{
+  while (_handler) {
+    auto current = _handler;
+    _handler = _handler->inner;
+    delete current;
+  }
+}
+
+template <class TBody>
+void
+Config<TBody>::addHandler(DelegateHandler<TBody> const * handler)
+{
+  handler->inner = _handler;
+  _handler = handler;
+}
+
+template <class TBody>
+void
+Config<TBody>::addRoute(Route<TBody> const & route)
+{
+  _routes.push(route);
+}
+
+template <class TBody>
+response<TBody>*
+Config<TBody>::handleRequest(request<TBody> const * request)
+{
+  return _handler->handle(request);
+}
+
+template <class TBody>
+response<TBody>*
+Config<TBody>::RouteRequestHandler::handleRequest(request<TBody> const * request)
+{
+  for (auto route = cbegin(_routes); route != cend(_routes); route++) {
+    if (auto response = route.handleRequestIfMatches(request))
+        return response;
+  }
+  return response<TBody>{status::bad_request};
+}
 
 static auto const INGRESS_REGEX = regex{"^/ingresses/?([?#].*)?$"};
 static auto const INGRESS_NAME_REGEX = regex{"^/ingresses/([^?#/]+)/?([?#].*)?$"};
@@ -26,6 +116,7 @@ static auto const EGRESS_NAME_REGEX = regex{"^/egresses/([^?#]+)/?([?#].*)?$"};
 static auto const RULE_REGEX = regex{"^/rules/?([?#].*)?$"};
 static auto const RULE_NAME_REGEX = regex{"^/rules/([^?#]+)/?([?#].*)?$"};
 static auto const ROUTE_REGEX = regex{"^/route/?([?#].*)?$"};
+static auto const CLEAR = regex{"^/clear$"};
 
 static auto genResp(http::status status) { return Rest::Response{status, 11}; }
 
@@ -160,13 +251,18 @@ Rest::Rest(IngressManager& ingresses, EgressManager& egresses, Router& router)
                      return genResp(http::status::no_content);
                    }),
         make_tuple(http::verb::options, ROUTE_REGEX, [](auto&&, auto&&) {
-          return options({http::verb::get, http::verb::put, http::verb::options});
-        })}
+                     return options({http::verb::get, http::verb::put, http::verb::options});
+                   }),
+        make_tuple(http::verb::post, CLEAR, [](auto&&, auto&&) {
+
+                   }),
+        }
 {
 }
 
 Rest::Response Rest::handle(Request const& req)
 {
+
   auto mr = cmatch{};
   auto it =
       find_if(cbegin(apis_), cend(apis_), [v = req.method(), t = req.target(), &mr](auto&& item) {
